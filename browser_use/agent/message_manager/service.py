@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 from datetime import datetime
 from typing import List, Optional, Type
 
@@ -10,6 +11,7 @@ from langchain_core.messages import (
 	AIMessage,
 	BaseMessage,
 	HumanMessage,
+	ToolMessage,
 )
 from langchain_openai import ChatOpenAI
 
@@ -29,11 +31,12 @@ class MessageManager:
 		action_descriptions: str,
 		system_prompt_class: Type[SystemPrompt],
 		max_input_tokens: int = 128000,
-		estimated_tokens_per_character: int = 3,
+		estimated_characters_per_token: int = 3,
 		image_tokens: int = 800,
 		include_attributes: list[str] = [],
 		max_error_length: int = 400,
 		max_actions_per_step: int = 10,
+		message_context: Optional[str] = None,
 	):
 		self.llm = llm
 		self.system_prompt_class = system_prompt_class
@@ -41,10 +44,11 @@ class MessageManager:
 		self.history = MessageHistory()
 		self.task = task
 		self.action_descriptions = action_descriptions
-		self.ESTIMATED_TOKENS_PER_CHARACTER = estimated_tokens_per_character
+		self.estimated_characters_per_token = estimated_characters_per_token
 		self.IMG_TOKENS = image_tokens
 		self.include_attributes = include_attributes
 		self.max_error_length = max_error_length
+		self.message_context = message_context
 
 		system_message = self.system_prompt_class(
 			self.action_descriptions,
@@ -54,8 +58,46 @@ class MessageManager:
 
 		self._add_message_with_tokens(system_message)
 		self.system_prompt = system_message
-		task_message = HumanMessage(content=f'Your task is: {task}')
+
+		if self.message_context:
+			context_message = HumanMessage(content=self.message_context)
+			self._add_message_with_tokens(context_message)
+
+		task_message = self.task_instructions(task)
 		self._add_message_with_tokens(task_message)
+		self.tool_id = 1
+		tool_calls = [
+			{
+				'name': 'AgentOutput',
+				'args': {
+					'current_state': {
+						'evaluation_previous_goal': 'Unknown - No previous actions to evaluate.',
+						'memory': '',
+						'next_goal': 'Start browser',
+					},
+					'action': [],
+				},
+				'id': str(self.tool_id),
+				'type': 'tool_call',
+			}
+		]
+
+		example_tool_call = AIMessage(
+			content=f'',
+			tool_calls=tool_calls,
+		)
+		self._add_message_with_tokens(example_tool_call)
+		tool_message = ToolMessage(
+			content=f'Browser started',
+			tool_call_id=str(self.tool_id),
+		)
+		self._add_message_with_tokens(tool_message)
+		self.tool_id += 1
+
+	@staticmethod
+	def task_instructions(task: str) -> HumanMessage:
+		content = f'Your ultimate task is: {task}. If you achieved your ultimate task, stop everything and use the done action in the next step to complete the task. If not, continue as usual.'
+		return HumanMessage(content=content)
 
 	def add_state_message(
 		self,
@@ -70,10 +112,10 @@ class MessageManager:
 			for r in result:
 				if r.include_in_memory:
 					if r.extracted_content:
-						msg = HumanMessage(content=str(r.extracted_content))
+						msg = HumanMessage(content='Action result: ' + str(r.extracted_content))
 						self._add_message_with_tokens(msg)
 					if r.error:
-						msg = HumanMessage(content=str(r.error)[-self.max_error_length :])
+						msg = HumanMessage(content='Action error: ' + str(r.error)[-self.max_error_length :])
 						self._add_message_with_tokens(msg)
 					result = None  # if result in history, we dont want to add it again
 
@@ -89,22 +131,75 @@ class MessageManager:
 
 	def _remove_last_state_message(self) -> None:
 		"""Remove last state message from history"""
-		if len(self.history.messages) > 2 and isinstance(
-			self.history.messages[-1].message, HumanMessage
-		):
+		if len(self.history.messages) > 2 and isinstance(self.history.messages[-1].message, HumanMessage):
 			self.history.remove_message()
 
 	def add_model_output(self, model_output: AgentOutput) -> None:
 		"""Add model output as AI message"""
+		tool_calls = [
+			{
+				'name': 'AgentOutput',
+				'args': model_output.model_dump(mode='json', exclude_unset=True),
+				'id': str(self.tool_id),
+				'type': 'tool_call',
+			}
+		]
 
-		content = model_output.model_dump_json(exclude_unset=True)
-		msg = AIMessage(content=content)
+		msg = AIMessage(
+			content='',
+			tool_calls=tool_calls,
+		)
+
 		self._add_message_with_tokens(msg)
+		# empty tool response
+		tool_message = ToolMessage(
+			content='',
+			tool_call_id=str(self.tool_id),
+		)
+		self._add_message_with_tokens(tool_message)
+		self.tool_id += 1
 
 	def get_messages(self) -> List[BaseMessage]:
 		"""Get current message list, potentially trimmed to max tokens"""
-		self.cut_messages()
-		return [m.message for m in self.history.messages]
+
+		msg = [m.message for m in self.history.messages]
+		# debug which messages are in history with token count # log
+		total_input_tokens = 0
+		logger.debug(f'Messages in history: {len(self.history.messages)}:')
+		for m in self.history.messages:
+			total_input_tokens += m.metadata.input_tokens
+			logger.debug(f'{m.message.__class__.__name__} - Token count: {m.metadata.input_tokens}')
+		logger.debug(f'Total input tokens: {total_input_tokens}')
+
+		return msg
+
+	def _add_message_with_tokens(self, message: BaseMessage) -> None:
+		"""Add message with token count metadata"""
+		token_count = self._count_tokens(message)
+		metadata = MessageMetadata(input_tokens=token_count)
+		self.history.add_message(message, metadata)
+
+	def _count_tokens(self, message: BaseMessage) -> int:
+		"""Count tokens in a message using the model's tokenizer"""
+		tokens = 0
+		if isinstance(message.content, list):
+			for item in message.content:
+				if 'image_url' in item:
+					tokens += self.IMG_TOKENS
+				elif isinstance(item, dict) and 'text' in item:
+					tokens += self._count_text_tokens(item['text'])
+		else:
+			msg = message.content
+			if hasattr(message, 'tool_calls'):
+				msg += str(message.tool_calls)  # type: ignore
+			tokens += self._count_text_tokens(msg)
+		return tokens
+
+	def _count_text_tokens(self, text: str) -> int:
+		"""Count tokens in a text string"""
+
+		tokens = len(text) // self.estimated_characters_per_token  # Rough estimate if no tokenizer available
+		return tokens
 
 	def cut_messages(self):
 		"""Get current message list, potentially trimmed to max tokens"""
@@ -139,7 +234,7 @@ class MessageManager:
 		proportion_to_remove = diff / msg.metadata.input_tokens
 		if proportion_to_remove > 0.99:
 			raise ValueError(
-				f'Max token limit reached - history is too long - reduce the system prompt or task less tasks or remove old messages. '
+				f'Max token limit reached - history is too long - reduce the system prompt or task. '
 				f'proportion_to_remove: {proportion_to_remove}'
 			)
 		logger.debug(
@@ -162,37 +257,3 @@ class MessageManager:
 		logger.debug(
 			f'Added message with {last_msg.metadata.input_tokens} tokens - total tokens now: {self.history.total_tokens}/{self.max_input_tokens} - total messages: {len(self.history.messages)}'
 		)
-
-	def _add_message_with_tokens(self, message: BaseMessage) -> None:
-		"""Add message with token count metadata"""
-		token_count = self._count_tokens(message)
-		metadata = MessageMetadata(input_tokens=token_count)
-		self.history.add_message(message, metadata)
-
-	def _count_tokens(self, message: BaseMessage) -> int:
-		"""Count tokens in a message using the model's tokenizer"""
-		tokens = 0
-		if isinstance(message.content, list):
-			for item in message.content:
-				if 'image_url' in item:
-					tokens += self.IMG_TOKENS
-				elif isinstance(item, dict) and 'text' in item:
-					tokens += self._count_text_tokens(item['text'])
-		else:
-			tokens += self._count_text_tokens(message.content)
-		return tokens
-
-	def _count_text_tokens(self, text: str) -> int:
-		"""Count tokens in a text string"""
-		if isinstance(self.llm, (ChatOpenAI, ChatAnthropic)):
-			try:
-				tokens = self.llm.get_num_tokens(text)
-			except Exception:
-				tokens = (
-					len(text) // self.ESTIMATED_TOKENS_PER_CHARACTER
-				)  # Rough estimate if no tokenizer available
-		else:
-			tokens = (
-				len(text) // self.ESTIMATED_TOKENS_PER_CHARACTER
-			)  # Rough estimate if no tokenizer available
-		return tokens
